@@ -17,7 +17,6 @@ export type LoopLimitRuntime =
 	| {
 			kind: "duration";
 			durationMs: number;
-			deadlineMs: number;
 	  };
 
 const TIME_UNITS_MS = new Map<string, number>([
@@ -139,43 +138,41 @@ function parseCompoundDuration(token: string): LoopLimitConfig | string | undefi
 	return { kind: "duration", durationMs: totalMs };
 }
 
-export function createLoopLimitRuntime(
-	config: LoopLimitConfig | undefined,
-	nowMs = Date.now(),
-): LoopLimitRuntime | undefined {
+export function createLoopLimitRuntime(config: LoopLimitConfig | undefined): LoopLimitRuntime | undefined {
 	if (!config) return undefined;
 	if (config.kind === "iterations") {
 		return { kind: "iterations", initial: config.iterations, remaining: config.iterations };
 	}
-	return { kind: "duration", durationMs: config.durationMs, deadlineMs: nowMs + config.durationMs };
+	return { kind: "duration", durationMs: config.durationMs };
 }
 
-export function consumeLoopLimitIteration(limit: LoopLimitRuntime | undefined, nowMs = Date.now()): boolean {
+export function consumeLoopLimitIteration(limit: LoopLimitRuntime | undefined): boolean {
 	if (!limit) return true;
-	if (limit.kind === "duration") {
-		return nowMs < limit.deadlineMs;
-	}
+	// Duration limits are firing intervals, not budgets: the interval timer
+	// governs cadence, so a tick is never "used up".
+	if (limit.kind === "duration") return true;
 	if (limit.remaining <= 0) return false;
 	limit.remaining -= 1;
 	return true;
 }
 
-export function isLoopDurationExpired(limit: LoopLimitRuntime | undefined, nowMs = Date.now()): boolean {
-	return limit?.kind === "duration" && nowMs >= limit.deadlineMs;
+/** Firing interval (ms) for a timer ("cron") loop, or undefined for a fire-on-stop loop. */
+export function getLoopIntervalMs(limit: LoopLimitRuntime | undefined): number | undefined {
+	return limit?.kind === "duration" ? limit.durationMs : undefined;
 }
 
 export function describeLoopLimit(config: LoopLimitConfig): string {
 	if (config.kind === "iterations") {
 		return `${config.iterations} ${config.iterations === 1 ? "iteration" : "iterations"}`;
 	}
-	return formatDuration(config.durationMs);
+	return `every ${formatDuration(config.durationMs)}`;
 }
 
 export function describeLoopLimitRuntime(limit: LoopLimitRuntime): string {
 	if (limit.kind === "iterations") {
 		return `${limit.remaining} of ${limit.initial} ${limit.initial === 1 ? "iteration" : "iterations"} remaining`;
 	}
-	return `${formatDuration(limit.durationMs)} limit`;
+	return `every ${formatDuration(limit.durationMs)}`;
 }
 
 function formatDuration(durationMs: number): string {

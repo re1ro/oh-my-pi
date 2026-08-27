@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Fixed `/loop` interrupting an in-progress turn to re-prompt. A duration-limited `/loop` (e.g. `/loop 30s`, `/loop 10m`) now reminds on that fixed interval instead: a live turn gets a non-interrupting reminder chained onto it, and an idle agent gets nudged, rather than the loop killing and restarting the stream.
+
 ## [18.0.7] - 2026-08-26
 
 ### Added

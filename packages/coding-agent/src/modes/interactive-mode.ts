@@ -197,7 +197,7 @@ import {
 	createLoopLimitRuntime,
 	describeLoopLimit,
 	describeLoopLimitRuntime,
-	isLoopDurationExpired,
+	getLoopIntervalMs,
 	type LoopLimitRuntime,
 	parseLoopLimitArgs,
 } from "./loop-limit";
@@ -616,6 +616,7 @@ export class InteractiveMode implements InteractiveModeContext {
 	loopPrompt: string | undefined = undefined;
 	loopLimit: LoopLimitRuntime | undefined = undefined;
 	#loopAutoSubmitTimer: NodeJS.Timeout | undefined;
+	#loopIntervalTimer: NodeJS.Timeout | undefined;
 	#todoAutoClearTimer: NodeJS.Timeout | undefined;
 	#modelCycleClearTimer: NodeJS.Timeout | undefined;
 	#nextAppearanceRequestToken = 1;
@@ -1588,6 +1589,11 @@ export class InteractiveMode implements InteractiveModeContext {
 	#scheduleLoopAutoSubmit(): void {
 		this.#cancelLoopAutoSubmit();
 		if (!this.loopModeEnabled || !this.loopPrompt) return;
+		// Interval ("cron") loops own their cadence via #loopIntervalTimer, armed
+		// independently of this idle-only getUserInput() cycle so a tick still
+		// fires while a turn is streaming. This turn-boundary grace is only for
+		// fire-on-stop loops (no interval configured).
+		if (getLoopIntervalMs(this.loopLimit) !== undefined) return;
 		const prompt = this.loopPrompt;
 		const loopAction = settings.get("loop.mode");
 		this.#deferLoopAutoSubmit(() => {
@@ -1609,6 +1615,54 @@ export class InteractiveMode implements InteractiveModeContext {
 			clearTimeout(this.#loopAutoSubmitTimer);
 			this.#loopAutoSubmitTimer = undefined;
 		}
+	}
+
+	/**
+	 * Arm the interval ("cron") timer for a duration-limited loop: it fires on
+	 * a fixed cadence for the lifetime of loop mode, independent of the idle
+	 * getUserInput() cycle, so it can nudge the agent whether a turn is
+	 * streaming or idle. Iteration-limited and unbounded loops fire on the
+	 * turn-boundary grace in #scheduleLoopAutoSubmit instead; this is a no-op
+	 * for them.
+	 */
+	#armLoopIntervalTimer(): void {
+		this.#cancelLoopIntervalTimer();
+		const intervalMs = getLoopIntervalMs(this.loopLimit);
+		if (intervalMs === undefined) return;
+		this.#loopIntervalTimer = setInterval(() => this.#fireLoopIntervalTick(), intervalMs);
+		this.#loopIntervalTimer.unref?.();
+	}
+
+	#cancelLoopIntervalTimer(): void {
+		if (this.#loopIntervalTimer) {
+			clearInterval(this.#loopIntervalTimer);
+			this.#loopIntervalTimer = undefined;
+		}
+	}
+
+	/**
+	 * One tick of an interval loop. A turn already streaming gets a
+	 * non-interrupting reminder chained onto it (`followUp`) instead of being
+	 * killed and re-prompted. An idle agent gets the same prompt delivered as
+	 * a fresh nudge through the normal submit path. Compacting/post-prompt
+	 * work (busy but not `isStreaming`) is skipped rather than risking
+	 * `session.prompt()` falling through to a fresh-turn start and throwing
+	 * `AgentBusyError`; the next tick retries. A tick landing in the narrow
+	 * gap between turns (busy flags clear but the next getUserInput() hasn't
+	 * re-armed onInputCallback yet) is likewise skipped.
+	 */
+	#fireLoopIntervalTick(): void {
+		if (!this.loopModeEnabled || this.loopModePaused || !this.loopPrompt) return;
+		const prompt = this.loopPrompt;
+		if (this.session.isStreaming) {
+			this.session
+				.prompt(prompt, { streamingBehavior: "followUp" })
+				.catch(err => logger.warn("loop interval reminder failed", { error: String(err) }));
+			return;
+		}
+		if (this.#isAutoSubmitBlocked()) return;
+		if (!this.onInputCallback) return;
+		this.onInputCallback(this.startPendingSubmission({ text: prompt }));
 	}
 
 	#scheduleGoalContinuation(): void {
@@ -1667,10 +1721,6 @@ export class InteractiveMode implements InteractiveModeContext {
 
 	#submitLoopPromptWhenReady(prompt: string): void {
 		if (!this.loopModeEnabled || this.loopPrompt !== prompt || !this.onInputCallback) return;
-		if (isLoopDurationExpired(this.loopLimit)) {
-			this.disableLoopMode("Loop time limit reached. Loop mode disabled.");
-			return;
-		}
 		if (this.#isAutoSubmitBlocked()) {
 			this.#deferLoopAutoSubmit(() => this.#submitLoopPromptWhenReady(prompt));
 			return;
@@ -1723,6 +1773,7 @@ export class InteractiveMode implements InteractiveModeContext {
 		this.loopPrompt = undefined;
 		this.loopLimit = undefined;
 		this.#cancelLoopAutoSubmit();
+		this.#cancelLoopIntervalTimer();
 		this.#syncLoopModeStatus();
 		if (wasEnabled) {
 			this.showStatus(message);
@@ -1762,10 +1813,23 @@ export class InteractiveMode implements InteractiveModeContext {
 		this.loopModePaused = false;
 		this.loopPrompt = undefined;
 		this.loopLimit = createLoopLimitRuntime(parsed.limit);
+		this.#armLoopIntervalTimer();
 		this.#syncLoopModeStatus();
-		const limitSuffix = parsed.limit ? ` Limited to ${describeLoopLimit(parsed.limit)}.` : "";
-		const remainingSuffix = this.loopLimit ? ` ${describeLoopLimitRuntime(this.loopLimit)}.` : "";
-		const tail = parsed.prompt ? "Repeating it after each turn." : "Your next prompt will repeat after each turn.";
+		const limitSuffix =
+			parsed.limit?.kind === "iterations"
+				? ` Limited to ${describeLoopLimit(parsed.limit)}.`
+				: parsed.limit?.kind === "duration"
+					? ` Reminding ${describeLoopLimit(parsed.limit)}, chained onto the current turn without interrupting it.`
+					: "";
+		const remainingSuffix = this.loopLimit?.kind === "iterations" ? ` ${describeLoopLimitRuntime(this.loopLimit)}.` : "";
+		const tail =
+			parsed.limit?.kind === "duration"
+				? parsed.prompt
+					? "It will be sent on that interval."
+					: "Your next prompt will be sent on that interval."
+				: parsed.prompt
+					? "Repeating it after each turn."
+					: "Your next prompt will repeat after each turn.";
 		this.showStatus(
 			`Loop mode enabled.${limitSuffix}${remainingSuffix} ${tail} Esc cancels the current iteration; /loop again to disable.`,
 		);
